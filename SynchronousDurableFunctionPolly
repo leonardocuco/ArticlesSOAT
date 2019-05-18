@@ -1,0 +1,227 @@
+# Introduction
+
+Si vous lisez cet article c'est que vous connaissez les  functions durables Azure et savez comment elles fonctionnent. De manière simplifiée vous lancez la fonction durable qui vous renvoie l'id de votre requête et vous utilisez cet id pour récupérer le status de votre traitement aussi souvent que nécessaire jusqu'à qu'à obtenir le résultat. Rien d'extravagant, il s'agit d'un processus classique pour un traitement asynchrone pouvant prendre un certain temps.
+
+Imaginez mainteant que vous travailliez sur le remplacement d'un service synchrone par une fonction durable et qu'aucune modification sur les très ancienes et nombreuses applications appelantes ne puissent etre faites afin de leur permettre de prendre en charge cet appel asynchrone... Ne vous inquietez pas, une solution "temporaire".
+
+ 
+
+# Polly à la rescousse !
+
+Polly (http://www.thepollyproject.org) est une bibliothèque très utilisée permettant de gérer les erreurs transitoires et de mettre en place facilement des strategies de Retry, Circuit Breaker, Timeouts et bien d'autres. Elle permet par exemple d'implémenter une strategie de retry en fonction d'un type particulier d'exception ou d'un type particulier de retour.
+
+Vous voyez en quoi Polly peut nous être utile dans notre objectif d'emulation d'appel synchrone à notre function durable ?!
+
+ 
+
+Et oui, nous allons créer une fonction Azure utilisant Polly pour mettre en place la stratégie suivante :
+
+    1 Faire un appel à notre fonction durable pour lancer l'exécution,
+
+    2 Utiliser Polly pour aller chercher le status de notre traitement prériodiquement,
+
+    3 Une fois notre résultat récupéré, le restituer à l'appelant.
+
+ 
+
+# Lancer l'excution de notre fonction durable
+
+Nous commençons par créer une Polly Policy rejouant l'appel à notre fonction durable toutes les x secondes tant que son execution retourne la valeur false pour un max d'essais donné.
+
+```sh
+
+var retryPolicy = Policy
+
+                .Handle<HttpRequestException>()
+
+                .OrResult<bool>(result => result == false)
+
+                .WaitAndRetryAsync(_maxRetryAttempts, i => _pauseBetweenFailures);
+
+```
+
+Maintenant que nos avons notre Policy, définissons ce qu'elle doit faire lors de son exécution : appeler notre fonction durable et retourner l'url où on pourra récupérer le résultat de son exécution. Notre fonction durable standard renvoie cette url dans la propriété statusQueryGetUri. L'exécution de notre Policy ressemble donc à ceci :
+
+```sh
+
+await retryPolicy.ExecuteAsync(async () =>
+
+            {
+
+                dynamic content = await httpClient
+
+                                                .GetAsync(durableFunctionURL)
+
+                                                .GetAwaiter().GetResult()
+
+                                                .EnsureSuccessStatusCode()
+
+                                               .Content.ReadAsAsync<JObject>();
+
+ 
+
+                getStatusURI = content.statusQueryGetUri;
+
+                return !String.IsNullOrEmpty(getStatusURI);
+
+            });
+
+```
+
+En résumé, l'exécution de notre Policy fait un appel Http à notre fonction durable, tente de récupérer l'url du getstatus et s'il n'y arrive, renvoie false. Comme une des règles de notre Policy était OrResult<bool>(result => result == false), en renvoyant false, son exécution sera relancée.
+
+ 
+
+L'ensemble de notre code de lancement de la fonction durable et de récupération du getStatusUrl ressemble donc à ceci :
+
+ 
+
+```sh
+
+private static async Task<string> RetrieveDurableFunctionGetStatusURL(HttpClient httpClient, string durableFunctionURL)
+
+{
+
+    string getStatusURI = String.Empty;
+
+ 
+
+    var retryPolicy = Policy
+
+        .Handle<HttpRequestException>()
+
+        .OrResult<bool>(result => result == false)
+
+        .WaitAndRetryAsync(_maxRetryAttempts, i => _pauseBetweenFailures);
+
+ 
+
+    await retryPolicy.ExecuteAsync(async () =>
+
+    {
+
+        dynamic content = await httpClient
+
+                                        .GetAsync(durableFunctionURL)
+
+                                        .GetAwaiter().GetResult()
+
+                                        .EnsureSuccessStatusCode()
+
+                                        .Content.ReadAsAsync<JObject>();
+
+ 
+
+        getStatusURI = content.statusQueryGetUri;
+
+        return !String.IsNullOrEmpty(getStatusURI);
+
+    });
+
+ 
+
+    return getStatusURI;
+
+}
+
+```
+
+ 
+
+# Récupérer le résultat de notre fonction durable
+
+D'une manière très similaire à ce que nous avons fait pour notre premier appel, nous allons utiliser notre getStatusUrl récupéré précédemment pour périodiquement demander le résultat de l'exécution à notre fonction durable. Notre fonction durable retournant "Complete" lorsque l'exécution est terminée avec succès ou "Failed" lorsqu'un problème survient, nous prendrons ces valeurs comme valeurs limites.
+
+Notre fonction ressemblera donc à ceci :
+
+```sh
+
+private static async Task<dynamic> RetrieveDurableFunctionOutput(HttpClient httpClient, string getStatusURI)
+
+{
+
+    var retryPolicy = Policy
+
+        .Handle<HttpRequestException>()
+
+        .OrResult<bool>(result => result == false)
+
+        .WaitAndRetryAsync(_maxRetryAttempts, i => _pauseBetweenFailures);
+
+ 
+
+    dynamic output = new object();
+
+ 
+
+    await retryPolicy.ExecuteAsync(async () =>
+
+    {
+
+        dynamic content = await httpClient
+
+                                        .GetAsync(getStatusURI)
+
+                                        .GetAwaiter().GetResult()
+
+                                        .EnsureSuccessStatusCode()
+
+                                        .Content.ReadAsAsync<JObject>();
+
+        output = content.output;
+
+        return content.runtimeStatus == "Completed" || content.runtimeStatus == "Failed";
+
+    });
+
+    return output;
+
+}
+
+```
+
+ 
+
+# Créer une Azure fonction classique englobant tout ce mecanisme
+
+Mettons maintenant en place une Azure Fonction classique nous permettant de faire tout ce travail et de renvoyer le résultat. Son code est assez simple puisqu'il reprend le code que nous avons créé précédemment pour ensuite retourner le résultat à l'appelant.
+
+```sh
+
+[FunctionName("Synchronous_Hello")]
+
+public static async Task<IActionResult> Run(
+
+    [HttpTrigger(AuthorizationLevel.Function, "get", "post", Route = null)] HttpRequest req,
+
+    ILogger log)
+
+{
+
+    var httpClient = new HttpClient();
+
+ 
+
+    var getStatusURI = await RetrieveDurableFunctionGetStatusURL(httpClient, _myDurableFunctionUrl);
+
+ 
+
+    dynamic output = await RetrieveDurableFunctionOutput(httpClient, getStatusURI);
+
+ 
+
+    return (ActionResult)new OkObjectResult(output) ?? new BadRequestResult();
+
+}
+
+```
+
+ 
+
+# Conclusion
+
+Bien qu'une fonction durable azure ne soit pas asynchrone pour rien, il peut exister certaines situations où un appel synchrone soit nécessaire, par exemple en remplacement temporaire d'un appel à un service anciennement synchrone substitué par une fonction durable. Quoiqu'il en soit, si vous êtes confrontés à cette situation, la solution présentée ici vous permet de réaliser cela de manière simple et efficace avec tout un champ de parametrage à portée de main pour vos stratégies de retries, afin de pouvoir les adapter au mieux à votre situation.
+
+ 
+
+Vous trouverez le code complete de cet article sur github.
